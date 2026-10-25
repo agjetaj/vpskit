@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# vpskit - menu + CLI.  Run without arguments for the interactive menu.
+
+VPSKIT_DIR="${VPSKIT_DIR:-/opt/vpskit}"
+for f in common system proxy ssh vpn; do
+  # shellcheck disable=SC1090
+  source "$VPSKIT_DIR/lib/$f.sh"
+done
+
+need_root
+load_conf
+db_init
+
+VERSION="2.0.0"
+
+# ---------------- users ----------------
+user_add() { # user_add TYPE NAME DAYS|+Nh [PASS]
+  local type=$1 n=$2 dur=$3 pass=$4 exp
+  valid_name "$n" || die "Emër i pavlefshëm: 3-32 shkronja të vogla/numra/-/_, fillon me shkronjë."
+  db_has "$n" && die "Përdoruesi '$n' ekziston."
+  if [[ $dur == *h ]]; then exp=$(( $(now) + ${dur%h} * 3600 ))
+  else [[ $dur =~ ^[0-9]+$ ]] || die "Ditët duhet të jenë numër."; exp=$(( $(now) + dur * 86400 )); fi
+
+  case $type in
+    proxy)
+      db_add "$(jq -cn --arg n "$n" --arg u "$(new_uuid)" --arg p "${pass:-$(rand_pass 20)}" \
+        --arg s "$(rand_b64 16)" --arg t "$(rand_hex 16)" --argjson e "$exp" --argjson c "$(now)" \
+        '{name:$n, type:"proxy", uuid:$u, pass:$p, ss_key:$s, token:$t, created:$c, expiry:$e}')"
+      apply_proxy
+      write_subscription "$n" ;;
+    ssh) pass=${pass:-$(rand_pass 10)}
+         ssh_add "$n" "$pass" "$exp" ;;
+    wg)  wg_add "$n" "$exp" ;;
+    *)   die "Lloj i panjohur: $type (proxy|ssh|wg)" ;;
+  esac
+  ok "U krijua '$n' ($type), skadon: $(fmt_date "$exp")"
+  # only the hash is stored, so this is the one time the SSH password is shown
+  [[ $type == ssh ]] && echo "  Fjalëkalimi: $pass"
+  user_show "$n"
+}
+
+user_del() {
+  local n=$1 type; type=$(db_field "$n" type)
+  [[ -n $type && $n != _* ]] || die "Përdoruesi '$n' nuk ekziston."
+  case $type in
+    proxy) local tok; tok=$(db_field "$n" token); db_del "$n"; apply_proxy
+           rm -f "$WWW/sub/$tok" "$WWW/sub/$tok.yaml" ;;
+    ssh)   ssh_del "$n" ;;
+    wg)    db_del "$n"; render_wg ;;
+  esac
+  ok "U fshi '$n'."
+}
+
+user_renew() {
+  local n=$1 days=$2 type exp base
+  type=$(db_field "$n" type); [[ -n $type ]] || die "Përdoruesi '$n' nuk ekziston."
+  [[ $days =~ ^[0-9]+$ ]] || die "Ditët duhet të jenë numër."
+  base=$(db_field "$n" expiry); (( base < $(now) )) && base=$(now)
+  exp=$(( base + days * 86400 ))
+  if [[ $type == ssh ]]; then ssh_renew "$n" "$exp"; else db_set "$n" expiry "$exp"; fi
+  ok "'$n' skadon tani: $(fmt_date "$exp")"
+}
+
+user_list() {
+  printf "%-20s %-7s %-17s %s\n" "EMRI" "LLOJI" "SKADON" "STATUSI"
+  local t; t=$(now)
+  jq -r '.[] | select(.name|startswith("_")|not) | [.name, .type, .expiry] | @tsv' "$DB" |
+  while IFS=$'\t' read -r n ty e; do
+    local st="aktiv"; (( e < t )) && st="skaduar"
+    printf "%-20s %-7s %-17s %s\n" "$n" "$ty" "$(fmt_date "$e")" "$st"
+  done
+}
+
+user_show() {
+  local n=$1 type; type=$(db_field "$n" type)
+  [[ -n $type ]] || die "Përdoruesi '$n' nuk ekziston."
+  echo "------------------------------------------------------------"
+  echo " Përdoruesi: $n   Lloji: $type   Skadon: $(fmt_date "$(db_field "$n" expiry)")"
+  echo "------------------------------------------------------------"
+  case $type in
+    proxy)
+      proxy_links "$n"
+      echo
+      echo " Subscription (v2rayN/v2rayNG/Hiddify/NekoBox):"
+      echo "   https://$DOMAIN/sub/$(db_field "$n" token)"
+      echo " Clash Meta / mihomo:"
+      echo "   https://$DOMAIN/sub/$(db_field "$n" token).yaml"
+      echo
+      echo " QR (subscription):"
+      qrencode -t ansiutf8 "https://$DOMAIN/sub/$(db_field "$n" token)" ;;
+    ssh)
+      cat <<EOF
+ Host/IP        : $DOMAIN / $IP
+ OpenSSH        : $P_SSH        Dropbear : $P_DROPBEAR, $P_DROPBEAR2
+ SSH-SSL        : $P_STUNNEL (dropbear), $P_STUNNEL2 (openssh)
+ SSH-WS         : $P_HTTP (pa TLS), $P_SSHWS (direkt)
+ SSH-WS-SSL     : $P_HTTPS (TLS, SNI $DOMAIN)
+ UDPGW (badvpn) : 127.0.0.1:$P_UDPGW
+ OpenVPN        : https://$DOMAIN/dl/vpskit-tcp.ovpn
+                  https://$DOMAIN/dl/vpskit-udp.ovpn
+                  (përdor emrin/fjalëkalimin SSH)
+ Payload WS     : GET / HTTP/1.1[crlf]Host: $DOMAIN[crlf]Upgrade: websocket[crlf][crlf]
+EOF
+      ;;
+    wg)
+      local conf; conf=$(wg_client_conf "$n")
+      echo "$conf"; echo
+      qrencode -t ansiutf8 <<<"$conf" ;;
+  esac
+}
+
+expire_users() {
+  local t n ty changed=0; t=$(now)
+  while IFS=$'\t' read -r n ty; do
+    [[ -z $n ]] && continue
+    case $ty in
+      ssh)   ssh_del "$n" ;;
+      wg)    db_del "$n"; render_wg ;;
+      proxy) local tok; tok=$(db_field "$n" token)
+             [[ -n $tok ]] && rm -f "$WWW/sub/$tok" "$WWW/sub/$tok.yaml"
+             db_del "$n"; changed=1 ;;
+    esac
+    echo "expired: $n ($ty)"
+  done < <(jq -r --argjson t "$t" '.[] | select(.expiry < $t and (.name|startswith("_")|not)) | [.name,.type] | @tsv' "$DB")
+  (( changed )) && apply_proxy
+  true
+}
+
+# ---------------- server ----------------
+SERVICES="nginx xray sing-box vpskit-dropbear vpskit-stunnel vpskit-sshws vpskit-udpgw wg-quick@wg0 openvpn-server@tcp openvpn-server@udp"
+
+status() {
+  echo " vpskit $VERSION  |  $DOMAIN  |  $IP"
+  echo " Xray $(xray version 2>/dev/null | head -1 | awk '{print $2}')  |  sing-box $(sing-box version 2>/dev/null | head -1 | awk '{print $3}')"
+  echo " Uptime: $(uptime -p)  |  RAM: $(free -m | awk '/Mem:/{print $3"/"$2" MB"}')  |  BBR: $(sysctl -n net.ipv4.tcp_congestion_control)"
+  echo
+  local s
+  for s in $SERVICES; do
+    if systemctl is-active --quiet "$s"; then printf " ${C_G}●${C_0} %s\n" "$s"
+    else printf " ${C_R}●${C_0} %s\n" "$s"; fi
+  done
+}
+
+restart_all() { local s; for s in $SERVICES; do systemctl restart "$s" 2>/dev/null; done; ok "U rinisën shërbimet."; }
+
+set_hop() {
+  [[ $1 == on || $1 == off ]] || die "Përdorimi: vpskit hop on|off"
+  set_conf HY2_HOP "$1"; load_conf
+  "$VPSKIT_DIR/firewall.sh"
+  local n; for n in $(jq -r '.[] | select(.type=="proxy" and (.name|startswith("_")|not)) | .name' "$DB"); do write_subscription "$n"; done
+  ok "Hysteria2 port hopping: $1 (UDP ${P_HY2_HOP/:/-} -> $P_HTTPS)"
+}
+
+change_domain() {
+  [[ -n $1 ]] || die "Përdorimi: vpskit domain DOMAIN.RI"
+  set_conf DOMAIN "$1"; load_conf
+  issue_cert; write_nginx; apply_proxy
+  systemctl restart nginx vpskit-stunnel
+  local n; for n in $(jq -r '.[] | select(.type=="proxy" and (.name|startswith("_")|not)) | .name' "$DB"); do write_subscription "$n"; done
+  ok "Domain i ri: $DOMAIN"
+}
+
+update_cores() {
+  install_xray; install_singbox
+  systemctl daemon-reload; apply_proxy
+  ok "Core-t u përditësuan."
+}
+
+backup() {
+  local f="/root/vpskit-backup-$(date +%Y%m%d-%H%M).tar.gz"
+  tar -czf "$f" -C / etc/vpskit etc/wireguard etc/openvpn/server 2>/dev/null
+  chmod 600 "$f"; ok "Backup: $f"
+}
+
+restore() {
+  [[ -f $1 ]] || die "Skedari nuk ekziston: $1"
+  tar -xzf "$1" -C /
+  load_conf; ssh_restore_all; render_wg; apply_proxy
+  local n; for n in $(jq -r '.[] | select(.type=="proxy") | .name' "$DB"); do write_subscription "$n"; done
+  write_nginx; restart_all
+  ok "Restore përfundoi. Nëse IP ose domain ka ndryshuar: vpskit domain DOMAIN"
+}
+
+# ---------------- menu ----------------
+ask() { local v; read -rp "$1" v; echo "$v"; }
+
+menu_add() {
+  local type=$1 n d p
+  n=$(ask " Emri: "); d=$(ask " Ditë (ose p.sh. 2h për provë): ")
+  [[ $type == ssh ]] && p=$(ask " Fjalëkalimi (bosh = automatik): ")
+  ( user_add "$type" "$n" "$d" "$p" )
+}
+
+menu() {
+  while true; do
+    clear
+    echo -e "${C_B}==================== vpskit $VERSION ====================${C_0}"
+    echo -e " $DOMAIN  |  $IP  |  $(jq '[.[]|select(.name|startswith("_")|not)]|length' "$DB") përdorues"
+    echo -e "${C_B}=========================================================${C_0}"
+    cat <<'EOF'
+  PËRDORUESIT
+   1) Shto përdorues proxy (Reality/XHTTP/WS/Hy2/TUIC/AnyTLS/SS)
+   2) Shto përdorues SSH + OpenVPN
+   3) Shto përdorues WireGuard
+   4) Përdorues provë (trial)
+   5) Shfaq përdoruesin (linke / QR / konfig)
+   6) Rinovo përdoruesin
+   7) Fshi përdoruesin
+   8) Lista e përdoruesve
+   9) Trafiku (Xray) / SSH online
+  SERVERI
+  10) Statusi i shërbimeve
+  11) Rinis të gjitha shërbimet
+  12) Hysteria2 port hopping on/off
+  13) Ndrysho domain-in / rinovo certifikatën
+  14) Përditëso Xray + sing-box
+  15) Backup
+  16) Restore
+   0) Dil
+EOF
+    local c; c=$(ask " Zgjedhja: ")
+    case $c in
+      1) menu_add proxy ;;
+      2) menu_add ssh ;;
+      3) menu_add wg ;;
+      4) local t h; t=$(ask " Lloji (proxy/ssh/wg): "); h=$(ask " Orë [1]: ")
+         ( user_add "$t" "trial$(rand_hex 2)" "${h:-1}h" ) ;;
+      5) ( user_show "$(ask " Emri: ")" ) ;;
+      6) ( user_renew "$(ask " Emri: ")" "$(ask " Ditë shtesë: ")" ) ;;
+      7) ( user_del "$(ask " Emri: ")" ) ;;
+      8) user_list ;;
+      9) echo " Trafiku Xray për përdorues:"; xray_traffic; echo; ssh_online ;;
+      10) status ;;
+      11) restart_all ;;
+      12) ( set_hop "$(ask " on/off: ")" ) ;;
+      13) ( change_domain "$(ask " Domain: ")" ) ;;
+      14) ( update_cores ) ;;
+      15) backup ;;
+      16) ( restore "$(ask " Skedari i backup-it: ")" ) ;;
+      0|q) exit 0 ;;
+      *) warn "Zgjedhje e pavlefshme." ;;
+    esac
+    echo; read -rp " Shtyp Enter për të vazhduar..." _
+  done
+}
+
+usage() {
+  cat <<EOF
+vpskit $VERSION
+  vpskit                         menuja
+  vpskit add proxy|ssh|wg EMRI DITË [FJALËKALIM]
+  vpskit trial proxy|ssh|wg [ORË]
+  vpskit del EMRI | renew EMRI DITË | show EMRI | list
+  vpskit traffic | online | status | restart
+  vpskit hop on|off | domain DOMAIN | update | backup | restore SKEDAR
+  vpskit expire                  (thirret automatikisht çdo 5 min)
+EOF
+}
+
+case ${1:-menu} in
+  menu)    menu ;;
+  add)     user_add "$2" "$3" "$4" "$5" ;;
+  trial)   user_add "$2" "trial$(rand_hex 2)" "${3:-1}h" ;;
+  del)     user_del "$2" ;;
+  renew)   user_renew "$2" "$3" ;;
+  show)    user_show "$2" ;;
+  list)    user_list ;;
+  traffic) xray_traffic ;;
+  online)  ssh_online ;;
+  status)  status ;;
+  restart) restart_all ;;
+  hop)     set_hop "$2" ;;
+  domain)  change_domain "$2" ;;
+  update)  update_cores ;;
+  backup)  backup ;;
+  restore) restore "$2" ;;
+  expire)  expire_users ;;
+  *)       usage ;;
+esac
