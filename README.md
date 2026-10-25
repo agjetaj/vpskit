@@ -1,8 +1,9 @@
 # vpskit
 
-Autoscript modern për VPN/proxy në VPS. Është version i ri i ideve nga `syapik96/aws`,
-me protokollet e reja (Reality, XHTTP, Hysteria2, TUIC, AnyTLS, SS-2022) dhe pa
-shërbimet e vjetruara (PPTP, L2TP, SSTP, SSR, V2Ray i vjetër).
+Autoscript modern për VPN/proxy në VPS, me Xray-core dhe sing-box: Reality, XHTTP,
+Hysteria2, TUIC, AnyTLS, Shadowsocks-2022, si dhe SSH-WS/SSL, WireGuard e OpenVPN.
+
+Repo: https://github.com/agjetaj/vpskit
 
 ## Sistemet e mbështetura
 
@@ -40,7 +41,7 @@ Kërkohet KVM, jo OpenVZ/LXC pa `/dev/net/tun`, plus systemd dhe një domain që
 
 ```bash
 apt-get update && apt-get install -y git
-git clone https://github.com/<user>/vpskit.git && cd vpskit
+git clone https://github.com/agjetaj/vpskit.git && cd vpskit
 bash install.sh
 ```
 
@@ -75,7 +76,7 @@ vpskit backup | restore /root/vpskit-backup-....tar.gz
 
 Përdoruesit e skaduar fshihen automatikisht çdo 5 minuta (`vpskit-expire.timer`).
 
-## Ndryshimet kryesore nga skripti i vjetër
+## Veçoritë kryesore
 
 - **Xray-core + sing-box** në versionin më të fundit (shkarkohen nga GitHub releases, `vpskit update`).
 - **Reality** (pa certifikatë, i vështirë për t'u dalluar), **XHTTP**, **Hysteria2**, **TUIC**, **AnyTLS**, **SS-2022**.
